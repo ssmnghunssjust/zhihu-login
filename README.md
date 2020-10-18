@@ -1,4 +1,4 @@
-# 新增爬取类
+# 新增爬取类，爬取登录后的推荐内容。推荐内容主要分为三种类型：zvideo、answer、article，zvideo和article好像都没啥用。这里只抓取了answer和article两种类型。
 ## 部分爬取结果展示
 ![pic](https://github.com/ssmnghunssjust/zhihu-login/blob/master/docs/log.png)
 ![pic](https://github.com/ssmnghunssjust/zhihu-login/blob/master/docs/mongodb1.png)
