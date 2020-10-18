@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
-
-__author__ = 'zkqiang'
-__zhihu__ = 'https://www.zhihu.com/people/z-kqiang'
-__github__ = 'https://github.com/zkqiang/Zhihu-Login'
+"""
+-------------------------------------------------
+   File Name：     zhihu_login.py 
+   Description :   Forked from https://github.com/zkqiang/zhihu-login，并增加了推荐内容的爬取
+   Author :        LSQ
+   date：          2020/10/16
+-------------------------------------------------
+   Change Activity:
+                   2020/10/16: None
+-------------------------------------------------
+"""
 
 import base64
 import hashlib
@@ -11,9 +18,16 @@ import json
 import re
 import threading
 import time
+import random
+# 日志模块
+import logging
+import sys
+
+import pytesseract
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 from http import cookiejar
 from urllib.parse import urlencode
-
 import execjs
 import requests
 from PIL import Image
@@ -23,11 +37,11 @@ class ZhihuAccount(object):
     """
     使用时请确定安装了 Node.js（7.0 以上版本） 或其他 JS 环境
     报错 execjs._exceptions.ProgramError: TypeError: 'exports' 就是没有安装
-
     然后在当前目录下执行: `$npm install jsdom`
     """
 
-    def __init__(self, username: str = None, password: str = None):
+    def __init__(self, username: str = None, password: str = None, logger=None):
+        self.logger = logger
         self.username = username
         self.password = password
 
@@ -61,11 +75,11 @@ class ZhihuAccount(object):
         需要在 Settings / Tools / Python Scientific / Show Plots in Toolwindow，取消勾选
         """
         if load_cookies and self.load_cookies():
-            print('读取 Cookies 文件')
+            self.logger.info('读取 Cookies 文件')
             if self.check_login():
-                print('登录成功')
+                self.logger.info('登录成功')
                 return True
-            print('Cookies 已过期')
+            self.logger.warning('Cookies 已过期')
 
         self._check_user_pass()
         self.login_data.update({
@@ -91,11 +105,11 @@ class ZhihuAccount(object):
         login_api = 'https://www.zhihu.com/api/v3/oauth/sign_in'
         resp = self.session.post(login_api, data=data, headers=headers)
         if 'error' in resp.text:
-            print(json.loads(resp.text)['error'])
+            self.logger.warning(json.loads(resp.text)['error'])
         if self.check_login():
-            print('登录成功')
+            self.logger.info('登录成功')
             return True
-        print('登录失败')
+        self.logger.warning('登录失败')
         return False
 
     def load_cookies(self):
@@ -158,7 +172,7 @@ class ZhihuAccount(object):
             if lang == 'cn':
                 import matplotlib.pyplot as plt
                 plt.imshow(img)
-                print('点击所有倒立的汉字，在命令行中按回车提交')
+                self.logger.info('点击所有倒立的汉字，在命令行中按回车提交')
                 points = plt.ginput(7)
                 capt = json.dumps({'img_size': [200, 44],
                                    'input_points': [[i[0] / 2, i[1] / 2] for i in points]})
@@ -172,6 +186,9 @@ class ZhihuAccount(object):
             return capt
         return ''
 
+    def _generate_captcha_text(self, img_stream):
+        return pytesseract.image_to_string(img_stream)
+
     def _get_signature(self, timestamp: int or str):
         """
         通过 Hmac 算法计算返回签名
@@ -183,7 +200,8 @@ class ZhihuAccount(object):
         grant_type = self.login_data['grant_type']
         client_id = self.login_data['client_id']
         source = self.login_data['source']
-        ha.update(bytes((grant_type + client_id + source + str(timestamp)), 'utf-8'))
+        # ha.update(bytes((grant_type + client_id + source + str(timestamp)), 'utf-8'))
+        ha.update((grant_type + client_id + source + str(timestamp)).encode('utf-8'))
         return ha.hexdigest()
 
     def _check_user_pass(self):
@@ -202,9 +220,232 @@ class ZhihuAccount(object):
     def _encrypt(form_data: dict):
         with open('./encrypt.js') as f:
             js = execjs.compile(f.read())
+            # js = execjs.compile(f.read(), cwd=r'C:\Users\Administrator\AppData\Roaming\npm\node_modules')
             return js.call('b', urlencode(form_data))
 
 
+class ZhihuCrawler(object):
+    '''
+    本项目爬取的是用户登录后的推荐内容。
+    数据类型主要分为三种：zvideo、answer、article，zvideo和article好像都没啥用。这里只抓取了answer和article两种类型。
+    '''
+
+    def __init__(self, username=None, password=None):
+        # 初始化日志功能
+        self.logger = Logger().logger
+        # 初始化cookie
+        self.account = ZhihuAccount(username, password, logger=self.logger)
+        self.account.login(captcha_lang='en', load_cookies=True)
+        # session加载cookie
+        self.session = requests.session()
+        self.session.cookies = cookiejar.LWPCookieJar(filename='./cookies.txt')
+        self.session.cookies.load(ignore_discard=True)
+        self.first_url = 'https://www.zhihu.com/'
+        self.headers = {
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.116 Safari/537.36',
+        }
+        # 初始化mongodb数据库
+        self.mongo = MongoClient('mongodb://127.0.0.1:27017')
+        self.collection = self.mongo['zhihu']['data']
+
+    def __del__(self):
+        self.mongo.close()
+
+    def _get_page(self, next_url=None):
+        url = next_url
+        try:
+            if url is None:
+                self.logger.info('正在获取第一页***')
+                resp = self.session.get(self.first_url, headers=self.headers)
+                if resp.status_code == 200:
+                    return resp
+                else:
+                    raise Exception(f'{resp.status_code}')
+            else:
+                url = url.encode().decode("raw_unicode_escape")
+                headers = self.headers
+                headers['referer'] = 'https://www.zhihu.com/'
+                self.logger.info(f'正在获取下一页***{url}')
+                resp = self.session.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp
+                else:
+                    raise Exception(f'{resp.status_code}')
+
+        except:
+            self.account.login(captcha_lang='en', load_cookies=False)
+            self.session.cookies = cookiejar.LWPCookieJar(filename='./cookies.txt')
+            self.session.cookies.load(ignore_discard=True)
+            self.logger.warning(f'Encountered a cookie error, now retrying _get_page({url}).')
+            time.sleep(random.uniform(1, 4))
+            self._get_page(url)
+
+    def _get_first_page_html(self, response):
+        html = response.content.decode()
+        # with open('zhihu.html', 'w', encoding='utf-8') as f:
+        #     f.write(html)
+        return html
+
+    def _get_first_page_data(self, html):
+        data = dict()
+        initial_data = re.findall('<script id="js-initialData" type="text/json">(.*?)</script>', html).pop()
+        initial_data = initial_data.encode().decode('raw_unicode_escape')
+        json_data = json.loads(initial_data)
+        json_answers = json_data['initialState']['entities'].get('answers')
+        item_list = list()
+        for answer_id, detail in json_answers.items():
+            # item文章
+            item = dict()
+            item['id'] = answer_id
+            item['type'] = detail.get('type', None)
+            item['url'] = detail.get('url', None)
+            item['author'] = dict()
+            item['author']['userType'] = detail['author'].get('userType', None)
+            item['author']['name'] = detail['author'].get('name', None)
+            item['createdTime'] = detail.get('createdTime', None)
+            item['updatedTime'] = detail.get('updatedTime', None)
+            item['votedupCount'] = detail.get('voteupCount', None)
+            item['thanksCount'] = detail.get('thanksCount', None)
+            item['commentCount'] = detail.get('commentCount', None)
+            item['question'] = dict()
+            item['question']['id'] = detail['question'].get('id', None)
+            item['question']['type'] = detail['question'].get('type', None)
+            item['question']['url'] = detail['question'].get('url', None)
+            item['question']['title'] = detail['question'].get('title', None)
+            item['content'] = detail.get('content', None)
+            item_list.append(item)
+        is_end = re.findall('"is_end":false', html).pop()
+        if 'false' in is_end:
+            next_url = re.findall('"paging".*?"next":"(.*?)"', html, re.DOTALL).pop()
+            data['next_url'] = next_url
+        data['item_list'] = item_list
+        return data
+
+    def _save_data(self, data):
+        for item in data.get('item_list'):
+            item['_id'] = item.get('id')
+            try:
+                self.collection.insert_one(item)
+            except DuplicateKeyError as e:
+                self.logger.warning(e)
+        return
+
+    def _get_json(self, response):
+        return response.json()
+
+    def _get_data(self, json):
+        data = dict()
+        item_list = list()
+        for each in json.get('data'):
+            print(each['target'].get('type'))
+            if each['target'].get('type') == 'zvideo':
+                continue
+            item = dict()
+            target = each.get('target')
+            item['id'] = target.get('id', None)
+            item['type'] = target.get('type', None)
+            item['url'] = target.get('url', None)
+            item['author'] = dict()
+            item['author']['userType'] = target['author'].get('user_type', None)
+            item['author']['name'] = target['author'].get('name', None)
+            item['createdTime'] = target.get('created_time', None)
+            item['updatedTime'] = target.get('updated_time', None)
+            item['votedupCount'] = target.get('voteup_count', None)
+            item['thanksCount'] = target.get('thanks_count', None)
+            item['commentCount'] = target.get('comment_count', None)
+            if item['type'] == 'answer':
+                item['question'] = dict()
+                item['question']['id'] = target['question'].get('id', None)
+                item['question']['type'] = target['question'].get('type', None)
+                item['question']['url'] = target['question'].get('url', None)
+                item['question']['title'] = target['question'].get('title', None)
+            item['content'] = target.get('content', None)
+            item_list.append(item)
+        is_end = json['paging'].get('is_end')
+        if not is_end:
+            next_url = json['paging'].get('next')
+            data['next_url'] = next_url.encode().decode('raw_unicode_escape')
+        data['item_list'] = item_list
+        return data
+
+    def run(self):
+        self.logger.info('开始爬取***')
+        next_url = None
+        # 1 发起首页请求、获取响应
+        response = self._get_page(next_url)
+        # 2 解析响应
+        html = self._get_first_page_html(response)
+        # 3 提取数据
+        data = self._get_first_page_data(html)
+        # 4 保存数据
+        self._save_data(data)
+        # 下一页请求
+        next_url = data.get('next_url', None)
+        time.sleep(5)
+        while True:
+            # try:
+            # 1 发起请求、获取响应
+            response = self._get_page(next_url)
+            # 2 解析响应
+            json = self._get_json(response)
+            # 3 提取数据
+            data = self._get_data(json)
+            # 4 保存数据
+            self._save_data(data)
+            # 下一页请求
+            next_url = data.get('next_url', None)
+            if next_url is None:
+                break
+            time.sleep(5)
+            # except Exception as e:
+            #     print(e)
+        self.logger.info('爬取结束***')
+
+
+class Logger(object):
+    def __init__(self):
+        # 获取logger对象
+        self._logger = logging.getLogger()
+        # 设置formart对象
+        self.formatter = logging.Formatter(fmt='%(asctime)s %(filename)s [line:%(lineno)d] %(levelname)s: %(message)s',
+                                           datefmt='%Y-%m-%d %H:%M:%S')
+        # 设置日志输出
+        self._logger.addHandler(self._get_file_handler('log.log'))
+        self._logger.addHandler(self._get_console_handler())
+        # 设置日志等级
+        self._logger.setLevel(logging.INFO)
+
+    def _get_file_handler(self, filename):
+        '''
+        获取文件日志handler
+        :param filename: 文件名
+        :return: filehandler
+        '''
+        # 实例化filehandler类
+        filehandler = logging.FileHandler(filename=filename, encoding='utf-8')
+        # 设置日志格式
+        filehandler.setFormatter(self.formatter)
+        return filehandler
+
+    def _get_console_handler(self):
+        '''
+        获取终端日志handler
+        :return: consolehandler
+        '''
+        # 实例化streamhandler类
+        consolehandler = logging.StreamHandler(sys.stdout)
+        # 设置日志格式
+        consolehandler.setFormatter(self.formatter)
+        return consolehandler
+
+    @property
+    def logger(self):
+        return self._logger
+
+
 if __name__ == '__main__':
-    account = ZhihuAccount('', '')
-    account.login(captcha_lang='en', load_cookies=True)
+    # 输入用户名和密码进行登录
+    username = ''
+    password = ''
+    crawler = ZhihuCrawler(username, password)
+    crawler.run()
