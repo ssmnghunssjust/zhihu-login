@@ -18,10 +18,16 @@ import json
 import re
 import threading
 import time
+import os
 import random
 # 日志模块
 import logging
 import sys
+# 邮件模块
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 
 import pytesseract
 from pymongo import MongoClient
@@ -40,10 +46,15 @@ class ZhihuAccount(object):
     然后在当前目录下执行: `$npm install jsdom`
     """
 
-    def __init__(self, username: str = None, password: str = None, logger=None):
+    def __init__(self, username: str = None, password: str = None, sender: str = None, receivers: list = None,
+                 mail_pass: str = None, logger=None):
         self.logger = logger
         self.username = username
         self.password = password
+
+        self.sender = sender
+        self.receivers = receivers
+        self.mail_pass = mail_pass
 
         self.login_data = {
             'client_id': 'c3cef7c66a1843f8b3a9e6a1e3160e20',
@@ -177,7 +188,11 @@ class ZhihuAccount(object):
                 capt = json.dumps({'img_size': [200, 44],
                                    'input_points': [[i[0] / 2, i[1] / 2] for i in points]})
             else:
-                img_thread = threading.Thread(target=img.show, daemon=True)
+                # img_thread = threading.Thread(target=img.show, daemon=True)
+                img_thread = threading.Thread(target=send_mail, args=(
+                    self.sender, self.receivers, self.mail_pass,
+                    'zhihu验证码为：\n<img src=\"cid:image1\">', 'captcha.jpg'),
+                                              daemon=True)
                 img_thread.start()
                 # 这里可自行集成验证码识别模块
                 capt = input('请输入图片里的验证码：')
@@ -230,11 +245,11 @@ class ZhihuCrawler(object):
     数据类型主要分为三种：zvideo、answer、article，zvideo和article好像都没啥用。这里只抓取了answer和article两种类型。
     '''
 
-    def __init__(self, username=None, password=None):
+    def __init__(self, username=None, password=None, sender=None, receivers=None, mail_pass=None):
         # 初始化日志功能
         self.logger = Logger().logger
         # 初始化cookie
-        self.account = ZhihuAccount(username, password, logger=self.logger)
+        self.account = ZhihuAccount(username, password, sender, receivers, mail_pass, logger=self.logger)
         self.account.login(captcha_lang='en', load_cookies=True)
         # session加载cookie
         self.session = requests.session()
@@ -443,9 +458,39 @@ class Logger(object):
         return self._logger
 
 
+def send_mail(sender, receivers, mail_pass, content, image):
+    # 第三方 SMTP 服务
+    mail_host = "smtp.qq.com"  # 设置服务器
+    message = MIMEMultipart()
+    message.attach(MIMEText(content, 'html', 'utf-8'))  # 正文内容   plain代表纯文本,html代表支持html文本
+    message['From'] = sender
+    message['To'] = ','.join(receivers)  # 与真正的收件人的邮箱不是一回事
+
+    subject = '%s自动邮件-%s' % (os.path.basename(__file__), time.ctime())
+    message['Subject'] = subject  # 邮件标题
+    # 将图片显示在正文
+    with open(image, 'rb') as f:
+        # 图片添加到正文
+        msgImage = MIMEImage(f.read())
+        # 定义图片ID
+    msgImage.add_header('Content-ID', '<image1>')
+    message.attach(msgImage)
+    try:
+        smtpObj = smtplib.SMTP_SSL(mail_host, 465)
+        smtpObj.login(sender, mail_pass)
+        smtpObj.sendmail(sender, receivers, str(message))  # message.as_string()
+        smtpObj.quit()
+        print("验证码邮件已发送至%s" % receivers[0])
+    except smtplib.SMTPException as e:
+        print(e)
+
+
 if __name__ == '__main__':
     # 输入用户名和密码进行登录
     username = ''
     password = ''
-    crawler = ZhihuCrawler(username, password)
+    sender = ''
+    receivers = ['']
+    mail_pass = ''
+    crawler = ZhihuCrawler(username, password, sender, receivers, mail_pass)
     crawler.run()
